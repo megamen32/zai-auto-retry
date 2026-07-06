@@ -86,11 +86,6 @@ function waitForElement(selector, timeout = 10000) {
 // ==================== Modal observer ====================
 let modalObserver = null;
 let retryTriggered = false;
-let pageWillReload = false;
-
-window.addEventListener('beforeunload', () => {
-  pageWillReload = true;
-});
 
 function startModalObserver() {
   if (modalObserver) return;
@@ -115,81 +110,81 @@ function stopModalObserver() {
   }
 }
 
-async function triggerRetry() {
-  await Promise.all(pendingUploadPromises);
+// ==================== Wait for send button enabled ====================
+function waitForSendButtonEnabled(timeout = 15000) {
+  return new Promise((resolve) => {
+    const check = () => {
+      const btn = document.querySelector('[aria-label="Send Message"] button');
+      if (!btn || btn.offsetParent === null) return null;
+      if (btn.disabled || btn.hasAttribute('disabled')) return null;
+      if (btn.classList.contains('disabled')) return null;
+      return btn;
+    };
+    const found = check();
+    if (found) return resolve(found);
 
-  const chatInput = deepQuerySelector('#chat-input');
-  const inputText = chatInput ? chatInput.value : '';
+    const observer = new MutationObserver(() => {
+      const b = check();
+      if (b) { observer.disconnect(); resolve(b); }
+    });
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ['disabled', 'class', 'aria-label']
+    });
 
-  await chrome.storage.local.set({
-    retryPending: true,
-    savedInputText: inputText
+    setTimeout(() => { observer.disconnect(); resolve(null); }, timeout);
   });
-
-  const cancelBtn = Array.from(document.querySelectorAll('button')).find(
-    btn => btn.innerText.trim() === 'Cancel'
-  );
-  cancelBtn?.click();
-
-  setTimeout(() => {
-    if (!pageWillReload) location.reload();
-  }, 2000);
 }
 
-// ==================== Retry init after reload ====================
-async function initRetry() {
-  const stored = await chrome.storage.local.get([
-    'retryPending',
-    'savedInputText',
-    'pendingFileUploads',
-    'pendingAuth'
-  ]);
+// ==================== Retry without reload ====================
+async function triggerRetry() {
+  try {
+    await Promise.all(pendingUploadPromises);
 
-  if (!stored.retryPending) return;
-
-  await waitForElement('[aria-label="Send Message"]');
-
-  const text = stored.savedInputText || '';
-  const files = stored.pendingFileUploads || [];
-  const auth = stored.pendingAuth || '';
-
-  if (files.length && auth) {
-    for (const fileData of files) {
-      const blob = await fetch(fileData.data).then(r => r.blob());
-      const formData = new FormData();
-      formData.append('file', blob, fileData.name);
-      try {
-        await fetch('https://chat.z.ai/api/v1/files/', {
-          method: 'POST',
-          headers: {
-            authorization: auth,
-            'x-region': 'overseas'
-          },
-          body: formData,
-          credentials: 'include'
-        });
-      } catch (e) {
-        console.error('File re‑upload failed', e);
-      }
+    const chatInput = deepQuerySelector('#chat-input');
+    const inputText = chatInput ? chatInput.value : '';
+    if (inputText) {
+      await chrome.storage.local.set({ savedInputText: inputText });
     }
+
+    const cancelBtn = Array.from(document.querySelectorAll('button')).find(
+      btn => btn.innerText.trim() === 'Cancel'
+    );
+    if (!cancelBtn) {
+      console.warn('[zai-auto-retry] Cancel button not found, aborting');
+      retryTriggered = false;
+      return;
+    }
+    cancelBtn.click();
+    console.log('[zai-auto-retry] Clicked Cancel, waiting for send button');
+
+    const sendBtn = await waitForSendButtonEnabled(15000);
+    if (!sendBtn) {
+      console.warn('[zai-auto-retry] Send button never enabled — aborting');
+      retryTriggered = false;
+      return;
+    }
+
+    const input = deepQuerySelector('#chat-input');
+    if (input && inputText && input.value !== inputText) {
+      input.value = inputText;
+      input.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+      input.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
+    }
+
+    sendBtn.click();
+    console.log('[zai-auto-retry] Resent message');
+
+    setTimeout(() => {
+      retryTriggered = false;
+      console.log('[zai-auto-retry] Retry lock released');
+    }, 8000);
+  } catch (e) {
+    console.error('[zai-auto-retry] triggerRetry failed', e);
+    retryTriggered = false;
   }
-
-  const chatInput = deepQuerySelector('#chat-input');
-  if (chatInput && text) {
-    chatInput.value = text;
-    chatInput.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
-    chatInput.dispatchEvent(new Event('change', { bubbles: true, composed: true }));
-  }
-
-  const sendBtn = document.querySelector('[aria-label="Send Message"] button');
-  sendBtn?.click();
-
-  await chrome.storage.local.remove([
-    'retryPending',
-    'savedInputText',
-    'pendingFileUploads',
-    'pendingAuth'
-  ]);
 }
 
 // ==================== Listen for toggle changes ====================
@@ -198,7 +193,6 @@ chrome.storage.onChanged.addListener((changes, area) => {
     autoRetryEnabled = changes.autoRetryEnabled.newValue;
     if (autoRetryEnabled) {
       retryTriggered = false;
-      pageWillReload = false;
       startModalObserver();
     } else {
       stopModalObserver();
@@ -213,5 +207,4 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (autoRetryEnabled) {
     startModalObserver();
   }
-  initRetry().catch(console.error);
 })();
